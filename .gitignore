@@ -33,3 +33,8 @@ flexllmgen/apps/data_wrangle/core
 
 # tmp scripts
 today_job.sh
+
+# IMPRESS artifacts (large / regenerable)
+impress_kv_store/
+flexllmgen_offload_dir/
+*.pt

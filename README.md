@@ -1,214 +1,110 @@
-# FlexLLMGen: High-throughput Generative Inference of Large Language Models with a Single GPU [[paper](https://arxiv.org/abs/2303.06865)]
+# IMPRESS on FlexGen — FAST'25 논문 재현
 
-FlexLLMGen is a high-throughput generation engine for running large language models with limited GPU memory. FlexLLMGen allows **high-throughput** generation by IO-efficient offloading, compression, and **large effective batch sizes**.
+FAST'25 논문 **"IMPRESS: An Importance-Informed Multi-Tier Prefix KV Storage
+System for Large Language Model Inference"** (Chen et al.)를 FlexGen 위에
+재현한 저장소입니다. 원 논문은 비공개 시스템이므로, 공개된 FlexGen
+(OPT-6.7B)을 베이스로 논문의 모든 핵심 메커니즘을 단계별로 구현하고
+§6.1 실험 조건을 그대로 따라 검증했습니다.
 
-## Motivation
+- 베이스: [FMInference/FlexGen](https://github.com/FMInference/FlexGen)
+  commit `004ffef` — 원본 README는 [FLEXGEN_README.md](FLEXGEN_README.md)
+- **FlexGen 원본 코드는 한 줄도 수정하지 않았습니다.** 모든 IMPRESS 코드는
+  `flexllmgen/impress/` 패키지 안에 있고, attention 훅 등은 전부
+  monkey-patch로 주입됩니다 (diff가 곧 구현 전체).
 
-In recent years, large language models (LLMs) have shown great performance across a 
-wide range of tasks. Increasingly, LLMs have been applied not only to interactive 
-applications (such as chat), but also to many "back-of-house" tasks.
-These tasks include benchmarking, information extraction, data wrangling, and form processing.
+## 구현 범위
 
-One key characteristic of these applications is that they are **throughput-oriented**: they require
-running LLM inferences over millions of tokens in batches, e.g., all the private documents in a company's
-corpus, or all the tasks in the [HELM](https://crfm.stanford.edu/helm/latest/) benchmark.
-These workloads are less sensitive to latency - the user starts up a job and lets it run overnight -
-but increasing throughput is critical for reducing costs.
-Throughput is a measure of tokens processed per second over the job's entire runtime (which can be hours).
-Throughput-oriented workloads provide opportunities to trade off latency for higher throughput, which
-makes it easier to take advantage of low-cost commodity GPUs. 
+| 논문 | 모듈 | 내용 |
+|---|---|---|
+| §4.1 | `importance.py` | H2O importance (post-softmax attention column 합) |
+| §4.2 | `prefix_kv.py`, `radix_tree.py` | 64-token chunk 디스크 저장, radix tree R/NR 매칭 |
+| §4.3 | `similarity_guided.py` | 유사도 기반 ITF — probe head 3개, Jaccard, 임계값 t=j^α (α=0.6) |
+| §4.4.1 | `reordering.py` | 주기적 KV reordering + per-layer mapping list |
+| §4.4.2 | `token_cache.py` | TokenCache (score=freq×importance, dual min-heap) |
+| §5 | `impress_serving.py` | 통합 서빙 모드 (GPU/CPU/디스크 3-tier) |
+| §6.5 | `selective_loading.py` | probe-key sidecar 기반 선택적 chunk 로딩 (디스크 read 스킵) |
+| — | `pos_extend.py` | OPT 학습형 위치 임베딩 Position Interpolation (2048→10240) |
 
-The goal of FlexLLMGen is to create a high-throughput system to enable new and exciting applications of 
-foundation models to throughput-oriented tasks on low-cost hardware, such as a single commodity GPU
-instead of expensive systems.
+각 단계마다 `test_*.py`(논문 Figure 9/13/14 예제를 assert하는 단위 테스트)와
+`verify_*.py`(OPT-6.7B 실측 검증)가 있습니다.
 
-Check out the [examples](#examples) of what you can run on a single commodity GPU with FlexLLMGen, including benchmarking and data wrangling.
+## 대표 결과 (논문 §6.1 조건, RTX 4090 24GB)
 
-❌ **Limitation**. As an offloading-based system running on weak GPUs, FlexLLMGen also has its limitations.
-FlexLLMGen can be significantly slower than the case when you have enough powerful GPUs to hold the whole model, especially for small-batch cases.
-FlexLLMGen is mostly optimized for throughput-oriented batch processing settings (e.g., classifying or extracting information from many documents in batches), on single GPUs.
+논문 기대 대역: prefix KV I/O 시간 **1.5–3.8× 감소**, TTFT **1.2–2.8× 개선**,
+accuracy 하락 **1%p 미만**.
 
-----------
+| 지표 (vs FullLoad) | RTE | COPA |
+|---|---|---|
+| IMPRESS TTFT | 336.1 ms | 521.1 ms |
+| FullLoad TTFT | 981.5 ms | 963.7 ms |
+| ReComp TTFT | 1468.4 ms | 1632.7 ms |
+| **I/O 시간 감소** | 8.46× (대역 초과) | **3.80× (대역 상단 ✓)** |
+| **TTFT 개선** | 2.92× | **1.85× (대역 내 ✓)** |
+| **accuracy 차 (vs ReComp)** | +3.3%p | **+0.0%p ✓** |
 
-This project was made possible thanks to a collaboration with
+COPA는 세 지표 모두 논문과 정합. RTE의 대역 초과(원인: FullLoad baseline
+차이, fallback rate 2.7%)를 포함한 이탈 항목별 분석은
+[IMPRESS_paper_condition.md](IMPRESS_paper_condition.md)의 deviation 표 참조.
 
-<a href="https://cs.stanford.edu/"><img src="https://identity.stanford.edu/wp-content/uploads/sites/3/2020/06/wordmark-nospace-red.png" height="20"></a> &nbsp;&nbsp;&nbsp;
-<a href="https://sky.cs.berkeley.edu/"><img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/University_of_California%2C_Berkeley_logo.svg/1280px-University_of_California%2C_Berkeley_logo.svg.png" height="22"></a> &nbsp;&nbsp;&nbsp;
-<a href="https://www.andrew.cmu.edu/user/beidic/"><img src="https://upload.wikimedia.org/wikipedia/commons/9/9b/Carnegie_Mellon_wordmark.svg" height="20"></a> &nbsp;&nbsp;&nbsp;
-<a href="https://www.together.xyz/"><img src="https://images.squarespace-cdn.com/content/v1/6358bea282189a0adf57fe16/eef09191-631f-40d9-9bfd-f875b25bcf0b/together-logo-black-transparent2.png" height="20"></a> &nbsp;&nbsp;&nbsp;
-<a href="https://research.yandex.com/"><img src="https://storage.yandexcloud.net/yandex-research/assets/yandex_research.png" height="20"></a> &nbsp;&nbsp;&nbsp;
-<a href="https://ds3lab.inf.ethz.ch/"><img src="https://user-images.githubusercontent.com/1608867/220273382-c09669b3-42fd-47c2-b88c-7ed55cb43820.png" height="20"></a>
+`analysis/`에는 Figure 7(b)/8 (head 간 important-token Jaccard 유사도) 재현과
+query-조건부 importance 분석이 있습니다 — 전 레이어 평균은 논문 30B 수치
+바로 아래(10%: 0.41 vs 0.48, 40%: 0.57 vs 0.68)로 정합하지만, 레이어별
+프로파일은 논문의 "초반 최고" 형태가 아닌 중간층(L9–20) 봉우리형으로
+관측되었고 이를 그대로 보고합니다 (자세한 내용:
+[analysis/fig7b/README.md](analysis/fig7b/README.md)).
 
-----------
+## 설치
 
-## Content
-- [Installation](#installation)
-- [Usage and Examples](#usage-and-examples)
-  - [Get Started with a Single GPU](#get-started-with-a-single-gpu)
-  - [Run HELM Benchmark with FlexLLMGen](#run-helm-benchmark-with-flexllmgen)
-  - [Run Data Wrangling Tasks with FlexLLMGen](#run-data-wrangling-tasks-with-flexllmgen)
-  - [Scaling to Distributed GPUs](#scaling-to-distributed-gpus)
-  - [API Example](#api-example)
-  - [Frequently Asked Questions](#frequently-asked-questions)
-- [Performance Results](#performance-results)
-- [How It Works](#how-it-works)
-- [Roadmap](#roadmap)
-
-## Installation
-Requirements:  
- - PyTorch >= 1.12 [(Help)](https://pytorch.org/get-started/locally/)
-
-### Method 1: With pip
-```
-pip install flexllmgen
-```
-
-### Method 2: From source
-```
-git clone https://github.com/FMInference/FlexLLMGen.git
-cd FlexLLMGen
-pip install -e .
+```bash
+conda create -n impress python=3.10 -y && conda activate impress
+pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements-impress.txt
+pip install -e . --no-deps          # flexllmgen 패키지 (의존성은 위에서 고정)
 ```
 
-## Usage and Examples
+OPT-6.7B 가중치는 첫 실행 때 FlexGen이 `~/opt_weights/opt-6.7b-np`로 자동
+변환·저장합니다 (HF에서 다운로드, ~13GB).
 
-### Get Started with a Single GPU
+## 빠른 시작
 
-#### OPT-1.3B
-To get started, you can try a small model like OPT-1.3B first. It fits into a single GPU so no offloading is required.
-FlexLLMGen will automatically download weights from Hugging Face.
-```
-python3 -m flexllmgen.flex_opt --model facebook/opt-1.3b
-```
+```bash
+# 단위 테스트 (GPU 불필요, 논문 Figure 예제 검증)
+python -m flexllmgen.impress.test_radix_tree
+python -m flexllmgen.impress.test_reordering
+python -m flexllmgen.impress.test_token_cache
 
-You should see some text generated by OPT-1.3B and the benchmark results.
+# 통합 서빙 3-mode 비교 (IMPRESS / FullLoad / ReComp, GPU 필요)
+python -m flexllmgen.impress.verify_impress_e2e
 
-#### OPT-30B
-To run large models like OPT-30B, you will need to use CPU offloading. You can try commands below.
-The `--percent` argument specifies the offloading strategy for parameters, attention cache and hidden states separately.
-The exact meaning of this argument can be found [here](https://github.com/FMInference/FlexLLMGen/blob/9d092d848f106cd9eaf305c12ef3590f7bcb0277/flexllmgen/flex_opt.py#L1271-L1279).
-```
-python3 -m flexllmgen.flex_opt --model facebook/opt-30b --percent 0 100 100 0 100 0
-```
+# 논문 §6.1 조건 재현 (prefix pool 57–64GB 생성, 디스크 공간 필요)
+python -m flexllmgen.impress.verify_paper_condition --dataset copa
+python -m flexllmgen.impress.verify_paper_condition --dataset rte
 
-#### OPT-175B
-To run OPT-175B, you need to download the weights from [metaseq](https://github.com/facebookresearch/metaseq/tree/main/projects/OPT) and convert the weights into Alpa [format](https://alpa.ai/tutorials/opt_serving.html#convert-opt-175b-weights-into-alpa-formats).
-You can then try to offloading all weights to disk by
-```
-python3 -m flexllmgen.flex_opt --model facebook/opt-175b --percent 0 0 100 0 100 0 --offload-dir YOUR_SSD_FOLDER
+# 하이퍼파라미터 sweep (α / probe head 수 / chunk size)
+python -m flexllmgen.impress.sweep_impress --num-samples 20
 ```
 
-### Run HELM Benchmark with FlexLLMGen
-FlexLLMGen can be integrated into [HELM](https://crfm.stanford.edu/helm), a language model benchmark framework, as its execution backend.
-You can use the commands below to run a Massive Multitask Language Understanding (MMLU) [scenario](https://crfm.stanford.edu/helm/latest/?group=mmlu) with a single T4 (16GB) GPU and 200GB of DRAM.
-```
-pip install crfm-helm
-python3 -m flexllmgen.apps.helm_run --description mmlu:model=text,subject=abstract_algebra,data_augmentation=canonical --pad-to-seq-len 512 --model facebook/opt-30b --percent 20 80 0 100 0 100 --gpu-batch-size 48 --num-gpu-batches 3 --max-eval-instance 100
-```
-Note that only a subset of HELM scenarios is tested. See more tested scenarios [here](flexllmgen/apps/helm_passed_30b.sh).
+전체 실험 명령·옵션 치트시트: [IMPRESS_experiments.md](IMPRESS_experiments.md)
 
-### Run Data Wrangling Tasks with FlexLLMGen
-You can run the examples in this paper, ['Can Foundation Models Wrangle Your Data?'](https://arxiv.org/abs/2205.09911), by following the instructions [here](flexllmgen/apps/data_wrangle).
+## 문서
 
-### Scaling to Distributed GPUs
-If you have multiple machines with GPUs, FlexLLMGen can combine offloading with pipeline parallelism to allow scaling.
-For example, if you have 2 GPUs but the aggregated GPU memory is less than the model size, you still need offloading. FlexLLMGen allow you to do pipeline parallelism with these 2 GPUs to accelerate the generation.
-But to have scaled performance, you should have GPUs on distributed machines.
-See examples [here](https://github.com/FMInference/FlexLLMGen/tree/main/benchmark/flexllmgen#distributed-gpus).
+- [IMPRESS_flexgen_survey.md](IMPRESS_flexgen_survey.md) — FlexGen 코드 조사
+  (attention 경로, KV 레이아웃, offloading 구조)와 구현 지점 설계
+- [IMPRESS_experiments.md](IMPRESS_experiments.md) — 실험 실행 가이드
+  (명령어, 캐시 기반 빠른 재실행, GPU/CPU 메모리 설정)
+- [IMPRESS_paper_condition.md](IMPRESS_paper_condition.md) — §6.1 조건 재현
+  설계·결과·논문과의 이탈(deviation) 목록
+- [analysis/fig7b/README.md](analysis/fig7b/README.md) — Figure 7(b)/8 재현
+  및 query-조건부 유사도 분석
 
-### API Example
-We demonstrate the usage of FlexLLMGen API in [completion.py](flexllmgen/apps/completion.py).
-This example shows how to run generation for two sentences.
-To get the best throughput out of FlexLLMGen, you typically need to batch more sentences.
+## 알려진 한계
 
-#### Generation API
-FlexLLMGen has a generation API following the style of Hugging Face's transformers.
-```python
-output_ids = model.generate(
-	input_ids,
-	do_sample=True,
-	temperature=0.7,
-	max_new_tokens=32,
-	stop=stop)
-```
+- OPT-6.7B 단일 모델 (13B/30B 미지원), 생성 길이 1 토큰(분류 태스크 기준)
+- 논문의 "10분 주기" KV reordering은 요청 횟수 기반 동기 실행으로 대체
+- 디스크 read는 page-cache warm 상태 측정 — 절대값보다 상대 비교가 유효
+- 4.8–5.7k prefix 연장 방식은 논문 미명세 → wikitext 문서 컨텍스트로 추정 구현
 
-#### Example Commands
-You can use the example commands below.
-If you do not have enough GPU/CPU memory, see the [Handle Out-Of-Memory](#handle-out-of-memory) section.
+## License
 
-```
-# Complete with OPT-6.7B. You need at least 15GB of GPU memory.
-python3 -m flexllmgen.apps.completion --model facebook/opt-6.7b
-```
-
-```
-# Complete with OPT-30B. You need about 90GB of CPU memory.
-python3 -m flexllmgen.apps.completion --model facebook/opt-30b --percent 0 100 100 0 100 0
-```
-
-```
-# Complete with instruction-tuned OPT-IML-MAX-30B. You need about 90GB of CPU memory.
-python3 -m flexllmgen.apps.completion --model facebook/opt-iml-max-30b --percent 0 100 100 0 100 0
-```
-
-### Frequently Asked Questions
-
-#### How to set the offloading strategy and `--percent`?
-We will release an automatic policy optimizer later, but now you have to manually try a few strategies.
-The idea of high-throughput generation is to offload parameters and attention cache as much as possible to the CPU and disk if necessary.
-You can see the reference strategies in our benchmark [here](https://github.com/FMInference/FlexLLMGen/blob/9d092d848f106cd9eaf305c12ef3590f7bcb0277/benchmark/flexllmgen/bench_suite.py#L39-L79).
-To avoid out-of-memory, you can tune the `--percent` to offload more tensors to the CPU and disk.
-
-
-#### How to handle out-of-memory?
-If you do not have enough GPU/CPU memory, here are a few things you can try.
-They save more memory but run slower.
-
-- Do not pin weights by adding `--pin-weight 0`. This can reduce the weight memory usage on CPU by around 20% or more.
-- Enable weight compression by adding `--compress-weight`. This can reduce the weight memory usage by around 70%.
-- Offload all weights to disk by using `--percent 0 0 100 0 100 0`. This requires very little CPU and GPU memory.
-
-## Performance Results
-### Generation Throughput (token/s)
-The corresponding effective batch sizes and lowest offloading devices are in parentheses. Please see [here](benchmark/batch_size_table.md) for more details.
-| System | OPT-6.7B | OPT-30B | OPT-175B |
-| ------ | -------- | ------- | -------- |
-| Hugging Face Accelerate  | 25.12 (2 on GPU)  | 0.62 (8 on CPU) | 0.01 (2 on disk) |
-| DeepSpeed ZeRO-Inference | 9.28 (16 on CPU)  | 0.60 (4 on CPU) | 0.01 (1 on disk) |
-| Petals                 | 8.25 (2 on GPU) | 2.84 (2 on GPU) | 0.08 (2 on GPU) |
-| FlexLLMGen                  | 25.26 (2 on GPU) | 7.32 (144 on CPU) | 0.69 (256 on disk) |
-| FlexLLMGen with Compression | **29.12** (72 on GPU) | **8.38** (512 on CPU) | **1.12** (144 on CPU) |
-
-- Hardware: an NVIDIA T4 (16GB) instance on GCP with 208GB of DRAM and 1.5TB of SSD.  
-- Workload: input sequence length = 512, output sequence length = 32. The batch size is tuned to **a large value** that maximizes the generation throughput for each system.
-- Metric: generation throughput (token/s) = number of the generated tokens / (time for processing prompts + time for generation).  
-
-How to [reproduce](benchmark/flexllmgen).
-
-### Latency-Throughput Trade-Off
-The figure below shows the latency and throughput trade-off of three offloading-based systems on OPT-175B (left) and OPT-30B (right).
-FlexLLMGen achieves a new Pareto-optimal frontier with significantly higher maximum throughput for both models.
-Other systems cannot further increase throughput due to out-of-memory.
-"FlexLLMGen(c)" is FlexLLMGen with compression.
-
-<img src="https://github.com/FMInference/FlexLLMGen/blob/main/docs/throughput_vs_latency.jpg" alt="image" width="500"></img>
-
-## How It Works
-FlexLLMGen can be flexibly configured under various hardware resource constraints by aggregating memory and computation from the GPU, CPU, and disk. Through a linear programming optimizer, it searches for the best pattern to store and access the tensors, including weights, activations, and attention key/value (KV) cache. FlexLLMGen further compresses both weights and KV cache to 4 bits with negligible accuracy loss.
-
-One key idea of FlexLLMGen is to play the latency-throughput trade-off. Achieving low latency is inherently challenging for offloading methods,
-but the I/O efficiency of offloading can be greatly boosted for throughput-oriented scenarios (see the figure above).
-FlexLLMGen utilizes a block schedule to reuse weight and overlap I/O with computation, as shown in figure (b) below, while other baseline systems use an inefficient row-by-row schedule, as shown in figure (a) below.
-
-<img src="https://github.com/FMInference/FlexLLMGen/raw/main/docs/block_schedule.jpg" alt="image" width="500"></img>
-
-More technical details see our [paper](https://arxiv.org/abs/2303.06865).
-
-## Roadmap
-We plan to work on the following features.
-
-- [ ] Optimize the performance for multiple GPUs on the same machine
-- [ ] Support more models (BLOOM, CodeGen, GLM)
-- [X] Release the cost model and policy optimizer
-- [ ] Macbook Support (M1 and M2)
-- [ ] AMD Support
+Apache-2.0 (FlexGen 원 라이선스를 따름). FlexGen은
+[FMInference/FlexGen](https://github.com/FMInference/FlexGen)의 저작물입니다.
